@@ -1,0 +1,11 @@
+version: '3.8'
+
+services:
+  tg-agent:
+    build: .
+    container_name: tg-ai-agent
+    restart: always # Автоматический перезапуск при падении или перезагрузке сервера
+    env_file:
+      - .env # Берем переменные из файла
+    volumes:
+      - ./data:/app/data # МАГИЯ VOLUME: сохраняем базу и сессию
