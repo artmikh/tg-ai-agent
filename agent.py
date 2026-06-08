@@ -1,13 +1,15 @@
 import os
 import asyncio
 import sqlite3
+import json
+import yaml
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import OpenAI
 
-# Загружаем переменные из .env
+# Загружаем переменные
 load_dotenv()
 
 API_ID = os.getenv("API_ID")
@@ -15,167 +17,128 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID")
-TARGET_CHANNELS = [ch.strip() for ch in os.getenv("TARGET_CHANNELS", "").split(",")]
-KEYWORDS = [kw.strip() for kw in os.getenv("KEYWORDS", "").split(",")]
+TARGET_CHANNELS = [ch.strip() for ch in os.getenv("TARGET_CHANNELS", "").split(",") if ch.strip()]
+KEYWORDS = [kw.strip() for kw in os.getenv("KEYWORDS", "").split(",") if kw.strip()]
 
-# Инициализируем клиента OpenAI
+# Загружаем конфиг
+with open("config.yaml", "r", encoding="utf-8") as f:
+    config = yaml.safe_load(f)
+
+# Инициализируем OpenAI
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- Настройка базы данных SQLite ---
-DB_PATH = "/app/data/agent_db.sqlite" # Путь внутри докера
+# --- БД ---
+DB_PATH = "/app/data/agent_db.sqlite"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS processed_messages (
-            channel_id TEXT,
-            message_id INTEGER,
-            PRIMARY KEY (channel_id, message_id)
-        )
-    ''')
+    conn.execute('''CREATE TABLE IF NOT EXISTS processed_messages (
+                    channel_id TEXT, message_id INTEGER, PRIMARY KEY (channel_id, message_id))''')
     conn.commit()
     conn.close()
 
-def is_message_processed(channel_id, message_id):
+def is_processed(channel_id, message_id):
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('SELECT 1 FROM processed_messages WHERE channel_id=? AND message_id=?', (str(channel_id), message_id))
-    result = cursor.fetchone()
+    cur = conn.execute('SELECT 1 FROM processed_messages WHERE channel_id=? AND message_id=?', (str(channel_id), message_id))
+    res = cur.fetchone()
     conn.close()
-    return result is not None
+    return res is not None
 
-def save_message(channel_id, message_id):
+def save_processed(channel_id, message_id):
     conn = sqlite3.connect(DB_PATH)
-    cursor = conn.cursor()
-    cursor.execute('INSERT OR IGNORE INTO processed_messages (channel_id, message_id) VALUES (?, ?)', (str(channel_id), message_id))
+    conn.execute('INSERT OR IGNORE INTO processed_messages VALUES (?, ?)', (str(channel_id), message_id))
     conn.commit()
     conn.close()
 
-# --- ИИ Функции ---
+# --- ИИ ---
 def check_relevance(text):
-    """Проверяет, подходит ли сообщение под ключевые слова (с учетом синонимов и опечаток)"""
-    prompt = f"""
-    Ты — анализатор текста. Определи, относится ли текст сообщения к следующим темам или ключевым словам: {', '.join(KEYWORDS)}.
-    Учитывай синонимы, опечатки, сленг и аббревиатуры (например, "свч" = "микроволновка").
-    Ответь ТОЛЬКО одним словом: YES (если относится) или NO (если не относится).
-    Текст: {text}
-    """
+    prompt = config['prompts']['filter'].format(keywords=", ".join(KEYWORDS), text=text)
     try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = ai_client.chat.completions.create(
+            model=config['ai']['model'],
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
-        answer = response.choices[0].message.content.strip().upper()
-        return answer == "YES"
+        return resp.choices[0].message.content.strip().upper() == "YES"
     except Exception as e:
-        print(f"Ошибка OpenAI при фильтрации: {e}")
+        print(f"OpenAI Filter Error: {e}")
         return False
 
 def format_message(text):
-    """Форматирует сообщение по шаблону"""
-    prompt = f"""
-    Ты — редактор. Извлеки из текста суть и оформи её строго по шаблону.
-    Если каких-то данных в тексте нет, пиши "Не указано".
-    
-    Шаблон:
-    🔥 **Найдено предложение!**
-    📦 **Товар/Услуга:** [Название]
-    💰 **Цена:** [Цена]
-    📍 **Локация/Контакт:** [Контакты]
-    📝 **Детали:** [Краткое описание своими словами, 1-2 предложения]
-
-    Текст для обработки:
-    {text}
-    """
+    prompt = config['prompts']['formatter'].format(text=text)
     try:
-        response = ai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        resp = ai_client.chat.completions.create(
+            model=config['ai']['model'],
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3
         )
-        return response.choices[0].message.content.strip()
+        # Парсим JSON от ИИ
+        data = json.loads(resp.choices[0].message.content.strip())
+        # Подставляем в шаблон из config.yaml
+        template = config['output_template']
+        return template.format(
+            product=data.get("product", "Не указано"),
+            price=data.get("price", "Не указано"),
+            contact=data.get("contact", "Не указано"),
+            details=data.get("details", "Не указано")
+        )
+    except json.JSONDecodeError:
+        print("ИИ вернул некорректный JSON. Пропускаем форматирование.")
+        return None
     except Exception as e:
-        print(f"Ошибка OpenAI при форматировании: {e}")
+        print(f"OpenAI Format Error: {e}")
         return None
 
-# --- Главная логика Агента ---
-async def agent_job(userbot: Client):
-    print(f"[{datetime.now()}] Запуск задачи агента...")
-    
-    # Смотрим сообщения за последний час (чтобы не читать всю историю)
-    time_threshold = datetime.now() - timedelta(hours=1)
+# --- Агент ---
+async def agent_job(userbot: Client, bot: Client):
+    print(f"[{datetime.now()}] Запуск парсинга...")
+    schedule_mins = config['parsing']['schedule_minutes']
+    time_threshold = datetime.now() - timedelta(minutes=schedule_mins)
+    limit = config['parsing']['messages_per_channel']
+    delay = config['parsing']['delay_between_channels']
 
     for channel in TARGET_CHANNELS:
-        print(f"Парсинг канала: {channel}")
+        print(f"Чтение: {channel}")
         try:
-            # Получаем последние 50 сообщений
-            async for message in userbot.get_chat_history(channel, limit=50):
+            async for message in userbot.get_chat_history(channel, limit=limit):
                 if message.date.replace(tzinfo=None) < time_threshold:
-                    break # Сообщения старше часа пропускаем
-                
-                if not message.text:
-                    continue # Пропускаем картинки/видео без текста
-
-                # Проверяем, обрабатывали ли уже
-                if is_message_processed(channel, message.id):
+                    break
+                if not message.text or is_processed(channel, message.id):
                     continue
 
-                # 1. Фильтруем через ИИ
                 if check_relevance(message.text):
-                    print(f"Найдено релевантное сообщение в {channel}: {message.text[:50]}...")
-                    
-                    # 2. Форматируем через ИИ
-                    formatted_text = format_message(message.text)
-                    if formatted_text:
-                        # 3. Отправляем в наш канал (от имени Бота)
-                        await userbot.send_message(
-                            chat_id=MY_CHANNEL_ID,
-                            text=formatted_text,
-                            parse_mode="Markdown"
-                        )
-                        print("Сообщение успешно отправлено!")
-                    
-                    # Сохраняем ID в базу, чтобы не обработать повторно
-                    save_message(channel, message.id)
-
+                    print(f"Совпадение в {channel}!")
+                    formatted = format_message(message.text)
+                    if formatted:
+                        # Отправляем через Бота
+                        await bot.send_message(chat_id=MY_CHANNEL_ID, text=formatted, parse_mode="Markdown")
+                        print("Отправлено в канал.")
+                    save_processed(channel, message.id)
         except Exception as e:
-            print(f"Ошибка при парсинге канала {channel}: {e}")
+            print(f"Ошибка чтения {channel}: {e}")
         
-        # ПАУЗА 5 СЕКУНД между каналами!
-        print("Пауза 5 секунд...")
-        await asyncio.sleep(5)
+        await asyncio.sleep(delay)
 
-    print(f"[{datetime.now()}] Задача агента завершена.")
+    print(f"[{datetime.now()}] Парсинг завершен.")
 
-# --- Точка входа ---
 async def main():
-    init_db() # Инициализируем БД
+    init_db()
 
-    # Создаем клиента от имени пользователя (для чтения)
-    # Сессия будет сохраняться в /app/data/user.session
-    userbot = Client(
-        name="user", 
-        api_id=API_ID, 
-        api_hash=API_HASH,
-        workdir="/app/data"
-    )
+    # Юзербот (для чтения)
+    userbot = Client("user", api_id=API_ID, api_hash=API_HASH, workdir="/app/data")
+    # Бот (для постинга)
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="/app/data")
 
-    # Настраиваем планировщик (каждый час)
+    schedule_mins = config['parsing']['schedule_minutes']
     scheduler = AsyncIOScheduler()
-    # Передаем объект userbot в функцию задачи
-    scheduler.add_job(agent_job, 'interval', hours=1, args=[userbot])
+    scheduler.add_job(agent_job, 'interval', minutes=schedule_mins, args=[userbot, bot])
 
-    async with userbot:
-        print("Юзербот запущен!")
+    async with userbot, bot:
+        print("Клиенты запущены!")
         scheduler.start()
-        print("Планировщик запущен. Агент работает.")
-        
-        # Запускаем задачу сразу при старте (чтобы не ждать час)
-        await agent_job(userbot)
-
-        # Держим скрипт работающим бесконечно
+        # Сразу запускаем первую проверку
+        await agent_job(userbot, bot)
+        print(f"Агент работает. Проверка каждые {schedule_mins} мин.")
         await asyncio.Event().wait()
 
 if __name__ == "__main__":

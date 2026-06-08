@@ -4,8 +4,9 @@ services:
   tg-agent:
     build: .
     container_name: tg-ai-agent
-    restart: always # Автоматический перезапуск при падении или перезагрузке сервера
+    restart: always
     env_file:
-      - .env # Берем переменные из файла
+      - .env
     volumes:
-      - ./data:/app/data # МАГИЯ VOLUME: сохраняем базу и сессию
+      - ./data:/app/data     # Для сессии и БД
+      - ./config.yaml:/app/config.yaml # Пробрасываем конфиг, чтобы юзер мог менять промпты прямо на сервере
