@@ -12,6 +12,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем ВСЕ необходимые файлы проекта
 COPY auth.py .
 COPY agent.py .
+COPY test_tg.py .
 COPY config.yaml .
 
 # Команда запуска по умолчанию (для постоянной работы агента)
