@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   tg-agent:
     build: .
@@ -8,5 +6,5 @@ services:
     env_file:
       - .env
     volumes:
-      - ./data:/app/data     # Для сессии и БД
-      - ./config.yaml:/app/config.yaml # Пробрасываем конфиг, чтобы юзер мог менять промпты прямо на сервере
+      - ./data:/app/data          # Для БД и сессии
+      - ./config.yaml:/app/config.yaml # Чтобы можно было менять промпты без пересборки

@@ -9,8 +9,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Копируем код агента
+# Копируем ВСЕ необходимые файлы проекта
+COPY auth.py .
 COPY agent.py .
+COPY config.yaml .
 
-# Команда запуска
+# Команда запуска по умолчанию (для постоянной работы агента)
 CMD ["python", "agent.py"]
