@@ -2,11 +2,12 @@ import os
 import asyncio
 import sqlite3
 import json
-import requests  # Добавили requests
 import yaml
+import re  # Для локального фильтра
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client
+from pyrogram.enums import ParseMode  # Правильный импорт для форматирования
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import OpenAI
 
@@ -17,7 +18,21 @@ API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-MY_CHANNEL_ID = os.getenv("MY_CHANNEL_ID") # Оставляем строкой
+
+# Умное определение ID (число или @username)
+raw_channel_id = os.getenv("MY_CHANNEL_ID")
+if not raw_channel_id:
+    print("ОШИБКА: MY_CHANNEL_ID не указан в .env")
+    exit(1)
+if raw_channel_id.startswith('@'):
+    MY_CHANNEL_ID = raw_channel_id
+else:
+    try:
+        MY_CHANNEL_ID = int(raw_channel_id)
+    except ValueError:
+        print("ОШИБКА: MY_CHANNEL_ID имеет неверный формат. Используйте @username или цифровой ID.")
+        exit(1)
+
 TARGET_CHANNELS = [ch.strip() for ch in os.getenv("TARGET_CHANNELS", "").split(",") if ch.strip()]
 KEYWORDS = [kw.strip() for kw in os.getenv("KEYWORDS", "").split(",") if kw.strip()]
 
@@ -51,21 +66,15 @@ def save_processed(channel_id, message_id):
     conn.commit()
     conn.close()
 
-# --- Отправка сообщений через Bot API ---
-def send_telegram_message(chat_id, text):
-    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-    payload = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "Markdown"
-    }
-    try:
-        response = requests.post(url, data=payload, timeout=10)
-        result = response.json()
-        if not result.get("ok"):
-            print(f"Ошибка отправки в Telegram: {result.get('description')}")
-    except Exception as e:
-        print(f"Сбой сети при отправке: {e}")
+# --- ЛОКАЛЬНЫЙ ФИЛЬТР ---
+def local_keyword_filter(text, keywords):
+    """Быстрый поиск ключевых слов в тексте без учета регистра"""
+    if not keywords:
+        return True
+    pattern = r'(?:' + '|'.join(map(re.escape, keywords)) + r')'
+    if re.search(pattern, text, re.IGNORECASE):
+        return True
+    return False
 
 # --- ИИ ---
 def check_relevance(text):
@@ -81,7 +90,7 @@ def check_relevance(text):
         print(f"OpenAI Filter Error: {e}")
         return False
 
-def format_message(text):
+def format_message(text, source_channel):
     prompt = config['prompts']['formatter'].format(text=text)
     try:
         resp = ai_client.chat.completions.create(
@@ -89,69 +98,130 @@ def format_message(text):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.3
         )
-        data = json.loads(resp.choices[0].message.content.strip())
+        raw_text = resp.choices[0].message.content.strip()
+        
+        # Чистим ответ от маркдаун-блоков
+        if raw_text.startswith("```json"):
+            raw_text = raw_text[7:]
+        if raw_text.startswith("```"):
+            raw_text = raw_text[3:]
+        if raw_text.endswith("```"):
+            raw_text = raw_text[:-3]
+            
+        clean_json = raw_text.strip()
+        data = json.loads(clean_json)
+        
+        # ИИ может вернуть один объект {} или массив [{}]. Приводим всё к массиву
+        if isinstance(data, dict):
+            items = [data]
+        elif isinstance(data, list):
+            items = data
+        else:
+            return []
+            
         template = config['output_template']
-        return template.format(
-            product=data.get("product", "Не указано"),
-            price=data.get("price", "Не указано"),
-            contact=data.get("contact", "Не указано"),
-            details=data.get("details", "Не указано")
-        )
-    except json.JSONDecodeError:
-        print("ИИ вернул некорректный JSON. Пропускаем форматирование.")
-        return None
+        results = []
+        
+        for item in items:
+            # Добавляем имя канала-источника
+            item["source_channel"] = source_channel
+            
+            # Экранируем фигурные скобки в значениях ИИ, чтобы не ломался .format()
+            safe_item = {}
+            for key, value in item.items():
+                if isinstance(value, str):
+                    safe_item[key] = value.replace("{", "{{").replace("}", "}}")
+                else:
+                    safe_item[key] = value
+            
+            # Форматируем
+            formatted_text = template.format(**safe_item)
+            results.append(formatted_text)
+            
+        return results
+        
     except Exception as e:
         print(f"OpenAI Format Error: {e}")
-        return None
+        return []
 
-# --- Агент ---
-async def agent_job(userbot: Client):
+# --- АГЕНТ ---
+async def agent_job(userbot: Client, bot: Client):
     print(f"[{datetime.now()}] Запуск парсинга...")
-    schedule_mins = config['parsing']['schedule_minutes']
-    time_threshold = datetime.now() - timedelta(minutes=schedule_mins)
+    # Берем глубину поиска из конфига (по умолчанию 24 часа, если не указано)
+    scan_hours = config['parsing'].get('scan_depth_hours', 24)
+    time_threshold = datetime.now() - timedelta(hours=scan_hours)
+    
+    # Берем лимит из конфига
     limit = config['parsing']['messages_per_channel']
     delay = config['parsing']['delay_between_channels']
+    schedule_mins = config['parsing']['schedule_minutes']
 
     for channel in TARGET_CHANNELS:
-        print(f"Чтение: {channel}")
+        print(f"Чтение: {channel} (лимит: {limit})")
         try:
             async for message in userbot.get_chat_history(channel, limit=limit):
+                # Проверяем дату
                 if message.date.replace(tzinfo=None) < time_threshold:
                     break
-                if not message.text or is_processed(channel, message.id):
+                
+                # Берем текст или подпись к медиа
+                text = message.text or message.caption
+                if not text or is_processed(channel, message.id):
                     continue
 
-                if check_relevance(message.text):
+                # ШАГ 1: Локальный фильтр
+                if not local_keyword_filter(text, KEYWORDS):
+                    continue
+                
+                # ШАГ 2: ИИ-фильтр
+                if check_relevance(text):
                     print(f"Совпадение в {channel}!")
-                    formatted = format_message(message.text)
-                    if formatted:
-                        # Отправляем через нашу новую надежную функцию
-                        send_telegram_message(MY_CHANNEL_ID, formatted)
-                        print("Отправлено в канал.")
+                    
+                    # ШАГ 3: Форматирование
+                    formatted_messages = format_message(text, f"@{channel}")
+                    
+                    if formatted_messages:
+                        # ШАГ 4: Отправка каждой позиции отдельно
+                        for msg_text in formatted_messages:
+                            try:
+                                await bot.send_message(
+                                    chat_id=MY_CHANNEL_ID,
+                                    text=msg_text,
+                                    parse_mode=ParseMode.HTML
+                                )
+                                print("Успешно отправлено в канал.")
+                                await asyncio.sleep(1) # Пауза 1 сек между сообщениями
+                            except Exception as send_err:
+                                print(f"Ошибка отправки: {send_err}")
+                    
+                    # Сохраняем ID исходного сообщения, чтобы не парсить повторно
                     save_processed(channel, message.id)
+                    
         except Exception as e:
             print(f"Ошибка чтения {channel}: {e}")
         
         await asyncio.sleep(delay)
 
-    print(f"[{datetime.now()}] Парсинг завершен.")
+    print(f"[{datetime.now()}] Парсинг завершен. Следующий запуск через {schedule_mins} мин.")
 
 async def main():
     init_db()
 
-    # Нам нужен только юзербот для чтения!
+    # Юзербот для чтения
     userbot = Client("user", api_id=API_ID, api_hash=API_HASH, workdir="/app/data")
+    # Бот для отправки
+    bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="/app/data")
 
     schedule_mins = config['parsing']['schedule_minutes']
     scheduler = AsyncIOScheduler()
-    # Убрали bot из аргументов
-    scheduler.add_job(agent_job, 'interval', minutes=schedule_mins, args=[userbot])
+    scheduler.add_job(agent_job, 'interval', minutes=schedule_mins, args=[userbot, bot])
 
-    async with userbot:
-        print("Юзербот запущен!")
+    async with userbot, bot:
+        print("Клиенты (Юзербот и Бот) запущены!")
         scheduler.start()
-        await agent_job(userbot) # Первый запуск
-        print(f"Агент работает. Проверка каждые {schedule_mins} мин.")
+        # Сразу запускаем первую проверку
+        await agent_job(userbot, bot)
+        # Держим скрипт работающим бесконечно
         await asyncio.Event().wait()
 
 if __name__ == "__main__":
