@@ -70,26 +70,21 @@ def get_text_hash(text):
 def save_new_message(channel, message_id, text, text_hash):
     """Сохраняет новое сообщение или помечает как дубль"""
     conn = sqlite3.connect(DB_PATH)
-    
-    # 1. Проверяем, не читали ли мы уже ЭТОТ конкретный пост из ЭТОГО канала
     cur = conn.execute('SELECT id FROM found_messages WHERE source_channel=? AND message_id=?', (channel, message_id))
     if cur.fetchone():
         conn.close()
-        return # Мы его уже обработали на прошлом круге
+        return
         
-    # 2. Проверяем, был ли уже такой хэш (дубль из другого канала)
     cur = conn.execute('SELECT id FROM found_messages WHERE text_hash=? AND status != "DUPLICATE"', (text_hash,))
     exists = cur.fetchone()
     
     if exists:
-        # Это кросс-канальный дубль
         conn.execute('INSERT INTO found_messages (source_channel, message_id, text_hash, raw_text, status) VALUES (?, ?, ?, ?, ?)',
                      (channel, message_id, text_hash, text, 'DUPLICATE'))
         conn.commit()
         conn.close()
         print(f"    ⚠️ Найден кросс-канальный дубль (оригинал БД ID {exists[0]}). Пропуск ИИ.")
     else:
-        # Уникальное сообщение
         conn.execute('INSERT INTO found_messages (source_channel, message_id, text_hash, raw_text, status) VALUES (?, ?, ?, ?, ?)',
                      (channel, message_id, text_hash, text, 'NEW'))
         conn.commit()
@@ -99,7 +94,7 @@ def save_new_message(channel, message_id, text, text_hash):
 def get_new_messages():
     """Берет сообщения для обработки ИИ"""
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute('SELECT id, raw_text, source_channel FROM found_messages WHERE status = "NEW"')
+    cur = conn.execute('SELECT id, raw_text, source_channel, message_id FROM found_messages WHERE status = "NEW"')
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -132,12 +127,26 @@ def check_relevance(text):
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1
         )
-        return resp.choices[0].message.content.strip().upper() == "YES"
+        answer = resp.choices[0].message.content.strip().upper()
+        
+        # ВАЖНО: Если ИИ вместо YES вернул JSON, значит он уже проверил текст и нашел там НКТ!
+        # Считаем это за "YES"
+        if "{" in answer and "}" in answer:
+            print(f"    [ИИ Фильтр] ИИ вернул JSON вместо YES. Считаем как релевантное!")
+            return True
+            
+        # Стандартная проверка
+        if "YES" in answer:
+            return True
+            
+        print(f"    [ИИ Фильтр] Сырой ответ: {answer}")
+        return False
+        
     except Exception as e:
-        print(f"OpenAI Filter Error: {e}")
+        print(f"    OpenAI Filter Error: {e}")
         return False
 
-def format_message(text, source_channel):
+def format_message(text, source_link):
     prompt = config['prompts']['formatter'].format(text=text)
     try:
         resp = ai_client.chat.completions.create(
@@ -146,6 +155,10 @@ def format_message(text, source_channel):
             temperature=0.3
         )
         raw_text = resp.choices[0].message.content.strip()
+        
+        # ВАЖНО: Выводим то, что реально ответил ИИ!
+        print(f"    [ИИ Формат] Сырой ответ: {raw_text}")
+        
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
         if raw_text.endswith("```"): raw_text = raw_text[:-3]
@@ -154,11 +167,16 @@ def format_message(text, source_channel):
         if isinstance(data, dict): items = [data]
         elif isinstance(data, list): items = data
         else: return []
+        
+        # Если ИИ вернул пустой список (не нашел НКТ в тексте)
+        if not items:
+            print("    [ИИ Формат] ИИ вернул пустой список. Нет позиций НКТ.")
+            return []
             
         template = config['output_template']
         results = []
         for item in items:
-            item["source_channel"] = source_channel
+            item["source_link"] = source_link
             safe_item = {}
             for key, value in item.items():
                 if isinstance(value, str):
@@ -167,8 +185,12 @@ def format_message(text, source_channel):
                     safe_item[key] = value
             results.append(template.format(**safe_item))
         return results
+    except json.JSONDecodeError as e:
+        print(f"    [ИИ Формат] Ошибка парсинга JSON: {e}")
+        print(f"    [ИИ Формат] Ответ был: {raw_text}")
+        return []
     except Exception as e:
-        print(f"OpenAI Format Error: {e}")
+        print(f"    [ИИ Формат] Общая ошибка: {e}")
         return []
 
 # --- АГЕНТ ---
@@ -185,7 +207,8 @@ async def collect_job(userbot: Client):
         try:
             async for message in userbot.get_chat_history(channel, limit=limit):
                 if message.date.replace(tzinfo=None) < time_threshold:
-                    break
+                    print(f"    [Время] Пропуск ID {message.id}: сообщение старое.")
+                    continue
                 
                 text = message.text or message.caption
                 if not text:
@@ -193,9 +216,10 @@ async def collect_job(userbot: Client):
 
                 # Локальный фильтр
                 if not local_keyword_filter(text, KEYWORDS):
+                    print(f"    [Локальный фильтр] Пропуск ID {message.id}: нет ключевых слов.")
                     continue
                 
-                # Вычисляем хэш и сохраняем в базу (с проверкой на дубли)
+                # Вычисляем хэш и сохраняем в базу (БЕЗ ссылки)
                 text_hash = get_text_hash(text)
                 save_new_message(channel, message.id, text, text_hash)
                 
@@ -214,21 +238,37 @@ async def process_job(bot: Client):
         print("Нет новых сообщений для ИИ-обработки.")
         return
 
-    for db_id, raw_text, source_channel in new_messages:
+    # Получаем db_id, raw_text, source_channel, message_id
+    for db_id, raw_text, source_channel, message_id in new_messages:
         print(f"  Обработка записи БД #{db_id} из {source_channel}...")
         
-        # ИИ-фильтр
+        # ИИ-фильтр получает ТОЛЬКО чистый текст!
         is_relevant = check_relevance(raw_text)
         if not is_relevant:
-            print(f"    ❌ ИИ-фильтр: отклонено (покупатель/не то).")
+            print(f"    ❌ ИИ-фильтр: отклонено.")
             update_message_status(db_id, 'REJECTED')
             continue
         
         print(f"    🎯 ИИ-фильтр пройден! Форматирование...")
-        formatted_messages = format_message(raw_text, f"@{source_channel}")
+        
+        # --- ГЕНЕРАЦИЯ ССЫЛКИ НА ЛЕТУ ---
+        if source_channel.startswith('@'):
+            # Если канал указан как @username
+            channel_slug = source_channel[1:]
+            source_link = f"https://t.me/{channel_slug}/{message_id}"
+        elif not str(source_channel).startswith('-'):
+            # Если канал указан просто как username (без @ и без минуса)
+            source_link = f"https://t.me/{source_channel}/{message_id}"
+        else:
+            # Если это числовой ID приватного канала (начинается с -100 или -)
+            clean_chat_id = str(source_channel)[4:] if str(source_channel).startswith("-100") else str(source_channel)[1:]
+            source_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
+        # ---------------------------------
+
+        # Передаем ссылку в шаблонизатор
+        formatted_messages = format_message(raw_text, source_link) 
         
         if formatted_messages:
-            # Отправляем КАЖДУЮ найденную позицию отдельным сообщением
             send_success = False
             for msg_text in formatted_messages:
                 try:
@@ -239,12 +279,11 @@ async def process_job(bot: Client):
                     )
                     print("    🚀 Успешно отправлено в канал.")
                     send_success = True
-                    await asyncio.sleep(1) # Пауза 1 сек между сообщениями
+                    await asyncio.sleep(1)
                 except Exception as send_err:
                     print(f"    ❌ Ошибка отправки: {send_err}")
             
             if send_success:
-                # Для Google Sheets сохраним все позиции через разделитель
                 update_message_status(db_id, 'POSTED', "\n\n---\n\n".join(formatted_messages))
             else:
                 update_message_status(db_id, 'SEND_ERROR')
