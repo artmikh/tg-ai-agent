@@ -3,15 +3,15 @@ import asyncio
 import sqlite3
 import json
 import yaml
-import re  # Для локального фильтра
+import re
+import hashlib  # Для хэширования текста и поиска дублей
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client
-from pyrogram.enums import ParseMode  # Правильный импорт для форматирования
+from pyrogram.enums import ParseMode
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import OpenAI
 
-# Загружаем переменные
 load_dotenv()
 
 API_ID = os.getenv("API_ID")
@@ -19,7 +19,6 @@ API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Умное определение ID (число или @username)
 raw_channel_id = os.getenv("MY_CHANNEL_ID")
 if not raw_channel_id:
     print("ОШИБКА: MY_CHANNEL_ID не указан в .env")
@@ -30,45 +29,93 @@ else:
     try:
         MY_CHANNEL_ID = int(raw_channel_id)
     except ValueError:
-        print("ОШИБКА: MY_CHANNEL_ID имеет неверный формат. Используйте @username или цифровой ID.")
+        print("ОШИБКА: MY_CHANNEL_ID имеет неверный формат.")
         exit(1)
 
 TARGET_CHANNELS = [ch.strip() for ch in os.getenv("TARGET_CHANNELS", "").split(",") if ch.strip()]
 KEYWORDS = [kw.strip() for kw in os.getenv("KEYWORDS", "").split(",") if kw.strip()]
 
-# Загружаем конфиг
 with open("config.yaml", "r", encoding="utf-8") as f:
     config = yaml.safe_load(f)
 
-# Инициализируем OpenAI
 ai_client = OpenAI(api_key=OPENAI_API_KEY)
 
-# --- БД ---
+# --- БАЗА ДАННЫХ ---
 DB_PATH = "/app/data/agent_db.sqlite"
 
 def init_db():
     conn = sqlite3.connect(DB_PATH)
-    conn.execute('''CREATE TABLE IF NOT EXISTS processed_messages (
-                    channel_id TEXT, message_id INTEGER, PRIMARY KEY (channel_id, message_id))''')
+    # Новая таблица, заточенная под ETL и будущую выгрузку
+    conn.execute('''CREATE TABLE IF NOT EXISTS found_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    source_channel TEXT,
+                    message_id INTEGER,
+                    text_hash TEXT,
+                    raw_text TEXT,
+                    status TEXT DEFAULT 'NEW',
+                    formatted_text TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )''')
     conn.commit()
     conn.close()
 
-def is_processed(channel_id, message_id):
-    conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute('SELECT 1 FROM processed_messages WHERE channel_id=? AND message_id=?', (str(channel_id), message_id))
-    res = cur.fetchone()
-    conn.close()
-    return res is not None
+def get_text_hash(text):
+    """Очищает текст от мусора и создает MD5 хэш для поиска дублей"""
+    # Убираем эмодзи, знаки препинания, переводим в нижний регистр
+    clean_text = re.sub(r'[^\w\s]', '', text, flags=re.UNICODE).lower().strip()
+    # Убираем лишние пробелы
+    clean_text = re.sub(r'\s+', ' ', clean_text)
+    return hashlib.md5(clean_text.encode('utf-8')).hexdigest()
 
-def save_processed(channel_id, message_id):
+def save_new_message(channel, message_id, text, text_hash):
+    """Сохраняет новое сообщение или помечает как дубль"""
     conn = sqlite3.connect(DB_PATH)
-    conn.execute('INSERT OR IGNORE INTO processed_messages VALUES (?, ?)', (str(channel_id), message_id))
+    
+    # 1. Проверяем, не читали ли мы уже ЭТОТ конкретный пост из ЭТОГО канала
+    cur = conn.execute('SELECT id FROM found_messages WHERE source_channel=? AND message_id=?', (channel, message_id))
+    if cur.fetchone():
+        conn.close()
+        return # Мы его уже обработали на прошлом круге
+        
+    # 2. Проверяем, был ли уже такой хэш (дубль из другого канала)
+    cur = conn.execute('SELECT id FROM found_messages WHERE text_hash=? AND status != "DUPLICATE"', (text_hash,))
+    exists = cur.fetchone()
+    
+    if exists:
+        # Это кросс-канальный дубль
+        conn.execute('INSERT INTO found_messages (source_channel, message_id, text_hash, raw_text, status) VALUES (?, ?, ?, ?, ?)',
+                     (channel, message_id, text_hash, text, 'DUPLICATE'))
+        conn.commit()
+        conn.close()
+        print(f"    ⚠️ Найден кросс-канальный дубль (оригинал БД ID {exists[0]}). Пропуск ИИ.")
+    else:
+        # Уникальное сообщение
+        conn.execute('INSERT INTO found_messages (source_channel, message_id, text_hash, raw_text, status) VALUES (?, ?, ?, ?, ?)',
+                     (channel, message_id, text_hash, text, 'NEW'))
+        conn.commit()
+        conn.close()
+        print(f"    ➕ Уникальное сообщение сохранено в базу.")
+
+def get_new_messages():
+    """Берет сообщения для обработки ИИ"""
+    conn = sqlite3.connect(DB_PATH)
+    cur = conn.execute('SELECT id, raw_text, source_channel FROM found_messages WHERE status = "NEW"')
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+def update_message_status(db_id, status, formatted_text=None):
+    """Обновляет статус после обработки ИИ"""
+    conn = sqlite3.connect(DB_PATH)
+    if formatted_text:
+        conn.execute('UPDATE found_messages SET status=?, formatted_text=? WHERE id=?', (status, formatted_text, db_id))
+    else:
+        conn.execute('UPDATE found_messages SET status=? WHERE id=?', (status, db_id))
     conn.commit()
     conn.close()
 
 # --- ЛОКАЛЬНЫЙ ФИЛЬТР ---
 def local_keyword_filter(text, keywords):
-    """Быстрый поиск ключевых слов в тексте без учета регистра"""
     if not keywords:
         return True
     pattern = r'(?:' + '|'.join(map(re.escape, keywords)) + r')'
@@ -99,136 +146,136 @@ def format_message(text, source_channel):
             temperature=0.3
         )
         raw_text = resp.choices[0].message.content.strip()
-        
-        # Чистим ответ от маркдаун-блоков
-        if raw_text.startswith("```json"):
-            raw_text = raw_text[7:]
-        if raw_text.startswith("```"):
-            raw_text = raw_text[3:]
-        if raw_text.endswith("```"):
-            raw_text = raw_text[:-3]
+        if raw_text.startswith("```json"): raw_text = raw_text[7:]
+        if raw_text.startswith("```"): raw_text = raw_text[3:]
+        if raw_text.endswith("```"): raw_text = raw_text[:-3]
             
-        clean_json = raw_text.strip()
-        data = json.loads(clean_json)
-        
-        # ИИ может вернуть один объект {} или массив [{}]. Приводим всё к массиву
-        if isinstance(data, dict):
-            items = [data]
-        elif isinstance(data, list):
-            items = data
-        else:
-            return []
+        data = json.loads(raw_text.strip())
+        if isinstance(data, dict): items = [data]
+        elif isinstance(data, list): items = data
+        else: return []
             
         template = config['output_template']
         results = []
-        
         for item in items:
-            # Добавляем имя канала-источника
             item["source_channel"] = source_channel
-            
-            # Экранируем фигурные скобки в значениях ИИ, чтобы не ломался .format()
             safe_item = {}
             for key, value in item.items():
                 if isinstance(value, str):
                     safe_item[key] = value.replace("{", "{{").replace("}", "}}")
                 else:
                     safe_item[key] = value
-            
-            # Форматируем
-            formatted_text = template.format(**safe_item)
-            results.append(formatted_text)
-            
+            results.append(template.format(**safe_item))
         return results
-        
     except Exception as e:
         print(f"OpenAI Format Error: {e}")
         return []
 
 # --- АГЕНТ ---
-async def agent_job(userbot: Client, bot: Client):
-    print(f"[{datetime.now()}] Запуск парсинга...")
-    # Берем глубину поиска из конфига (по умолчанию 24 часа, если не указано)
+async def collect_job(userbot: Client):
+    """ЭТАП 1: Сбор данных из каналов"""
+    print(f"\n[{datetime.now()}] 📡 ЗАПУСК СБОРЩИКА...")
     scan_hours = config['parsing'].get('scan_depth_hours', 24)
     time_threshold = datetime.now() - timedelta(hours=scan_hours)
-    
-    # Берем лимит из конфига
     limit = config['parsing']['messages_per_channel']
     delay = config['parsing']['delay_between_channels']
-    schedule_mins = config['parsing']['schedule_minutes']
 
     for channel in TARGET_CHANNELS:
         print(f"Чтение: {channel} (лимит: {limit})")
         try:
             async for message in userbot.get_chat_history(channel, limit=limit):
-                # Берем текст или подпись к медиа
+                if message.date.replace(tzinfo=None) < time_threshold:
+                    break
+                
                 text = message.text or message.caption
-                if not text or is_processed(channel, message.id):
+                if not text:
                     continue
-                
-                # СРАЗУ СОХРАНЯЕМ ID СООБЩЕНИЯ В БАЗУ!
-                save_processed(channel, message.id)
 
-                # Выводим, что сообщение вообще увидели
-                print(f"  Анализирую (ID:{message.id}): {text[:60]}...")
-
-                # ШАГ 1: Локальный фильтр
+                # Локальный фильтр
                 if not local_keyword_filter(text, KEYWORDS):
-                    print(f"    ❌ Локальный фильтр: нет ключевых слов. Пропуск.")
-                    continue
-                print(f"    ✅ Локальный фильтр пройден!")
-                
-                # ШАГ 2: ИИ-фильтр
-                is_relevant = check_relevance(text)
-                if not is_relevant:
-                    print(f"    ❌ ИИ-фильтр: это не продажа или не то. Пропуск.")
                     continue
                 
-                print(f"    🎯 ИИ-фильтр: Это продажа НКТ! Отправляем на форматирование...")
+                # Вычисляем хэш и сохраняем в базу (с проверкой на дубли)
+                text_hash = get_text_hash(text)
+                save_new_message(channel, message.id, text, text_hash)
                 
-                # ШАГ 3: Форматирование
-                formatted_messages = format_message(text, f"@{channel}")
-                
-                if formatted_messages:
-                    # ШАГ 4: Отправка каждой позиции отдельно
-                    for msg_text in formatted_messages:
-                        try:
-                            await bot.send_message(
-                                chat_id=MY_CHANNEL_ID,
-                                text=msg_text,
-                                parse_mode=ParseMode.HTML
-                            )
-                            print("    🚀 Успешно отправлено в канал.")
-                            await asyncio.sleep(1) # Пауза 1 сек между сообщениями
-                        except Exception as send_err:
-                            print(f"    ❌ Ошибка отправки: {send_err}")
-                else:
-                    print("    ⚠️ ИИ не смог извлечь данные из текста.")
-                    
         except Exception as e:
             print(f"Ошибка чтения {channel}: {e}")
-        
         await asyncio.sleep(delay)
+    print(f"[{datetime.now()}] 📡 Сбор завершен.")
 
-    print(f"[{datetime.now()}] Парсинг завершен. Следующий запуск через {schedule_mins} мин.")
+
+async def process_job(bot: Client):
+    """ЭТАП 2: Обработка ИИ и публикация"""
+    print(f"\n[{datetime.now()}] 🧠 ЗАПУСК ОБРАБОТЧИКА ИИ...")
+    new_messages = get_new_messages()
+    
+    if not new_messages:
+        print("Нет новых сообщений для ИИ-обработки.")
+        return
+
+    for db_id, raw_text, source_channel in new_messages:
+        print(f"  Обработка записи БД #{db_id} из {source_channel}...")
+        
+        # ИИ-фильтр
+        is_relevant = check_relevance(raw_text)
+        if not is_relevant:
+            print(f"    ❌ ИИ-фильтр: отклонено (покупатель/не то).")
+            update_message_status(db_id, 'REJECTED')
+            continue
+        
+        print(f"    🎯 ИИ-фильтр пройден! Форматирование...")
+        formatted_messages = format_message(raw_text, f"@{source_channel}")
+        
+        if formatted_messages:
+            # Отправляем КАЖДУЮ найденную позицию отдельным сообщением
+            send_success = False
+            for msg_text in formatted_messages:
+                try:
+                    await bot.send_message(
+                        chat_id=MY_CHANNEL_ID,
+                        text=msg_text,
+                        parse_mode=ParseMode.HTML
+                    )
+                    print("    🚀 Успешно отправлено в канал.")
+                    send_success = True
+                    await asyncio.sleep(1) # Пауза 1 сек между сообщениями
+                except Exception as send_err:
+                    print(f"    ❌ Ошибка отправки: {send_err}")
+            
+            if send_success:
+                # Для Google Sheets сохраним все позиции через разделитель
+                update_message_status(db_id, 'POSTED', "\n\n---\n\n".join(formatted_messages))
+            else:
+                update_message_status(db_id, 'SEND_ERROR')
+        else:
+            print("    ⚠️ ИИ не смог извлечь данные.")
+            update_message_status(db_id, 'FORMAT_ERROR')
+
+    print(f"[{datetime.now()}] 🧠 Обработка завершена.")
+
+
+async def full_agent_job(userbot: Client, bot: Client):
+    """Главная функция, запускаемая по расписанию"""
+    await collect_job(userbot)
+    await process_job(bot)
+    schedule_mins = config['parsing']['schedule_minutes']
+    print(f"\n[{datetime.now()}] Цикл завершен. Следующий запуск через {schedule_mins} мин.")
+
 
 async def main():
     init_db()
-
-    # Юзербот для чтения
     userbot = Client("user", api_id=API_ID, api_hash=API_HASH, workdir="/app/data")
-    # Бот для отправки
     bot = Client("bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, workdir="/app/data")
 
     schedule_mins = config['parsing']['schedule_minutes']
     scheduler = AsyncIOScheduler()
-    scheduler.add_job(agent_job, 'interval', minutes=schedule_mins, args=[userbot, bot])
+    scheduler.add_job(full_agent_job, 'interval', minutes=schedule_mins, args=[userbot, bot])
 
     async with userbot, bot:
-        print("Клиенты (Юзербот и Бот) запущены!")
+        print("Клиенты запущены!")
         scheduler.start()
-        # Сразу запускаем первую проверку
-        await agent_job(userbot, bot)
-        # Держим скрипт работающим бесконечно
+        await full_agent_job(userbot, bot)
         await asyncio.Event().wait()
 
 if __name__ == "__main__":

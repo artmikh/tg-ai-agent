@@ -5,6 +5,9 @@ RUN apt-get update && apt-get install -y gcc libffi-dev && rm -rf /var/lib/apt/l
 
 WORKDIR /app
 
+# Отключаем буферизацию вывода в Docker
+ENV PYTHONUNBUFFERED=1
+
 # Копируем зависимости и устанавливаем их
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
@@ -12,8 +15,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 # Копируем ВСЕ необходимые файлы проекта
 COPY auth.py .
 COPY agent.py .
-COPY test_tg.py .
-COPY test_full.py .
+# COPY test_tg.py .
+# COPY test_full.py .
 COPY config.yaml .
 
 # Команда запуска по умолчанию (для постоянной работы агента)
