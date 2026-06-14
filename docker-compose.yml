@@ -8,3 +8,4 @@ services:
     volumes:
       - ./data:/app/data          # Для БД и сессии
       - ./config.yaml:/app/config.yaml # Чтобы можно было менять промпты без пересборки
+      - ./credentials.json:/app/credentials.json

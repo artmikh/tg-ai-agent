@@ -5,6 +5,13 @@ import json
 import yaml
 import re
 import hashlib  # Для хэширования текста и поиска дублей
+import csv
+import pickle
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from pyrogram import Client
@@ -13,6 +20,8 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from openai import OpenAI
 
 load_dotenv()
+
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID")
 
 API_ID = os.getenv("API_ID")
 API_HASH = os.getenv("API_HASH")
@@ -108,6 +117,90 @@ def update_message_status(db_id, status, formatted_text=None):
         conn.execute('UPDATE found_messages SET status=? WHERE id=?', (status, db_id))
     conn.commit()
     conn.close()
+
+def upload_file_to_drive(filename, filepath):
+    """Загружает локальный файл на Google Drive через OAuth (от имени пользователя)"""
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        print("  [GDrive] Пропуск: не настроен ID папки")
+        return False
+
+    creds = None
+    token_path = '/app/data/token.pickle'
+    credentials_path = '/app/credentials.json'
+    
+    if not os.path.exists(credentials_path):
+         print("  [GDrive] Пропуск: нет файла credentials.json")
+         return False
+
+    # Загружаем токен, если он есть
+    if os.path.exists(token_path):
+        with open(token_path, 'rb') as token:
+            creds = pickle.load(token)
+
+    # Если токена нет или он просрочен
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            try:
+                creds.refresh(Request())
+                # Сохраняем обновленный токен
+                with open(token_path, 'wb') as token:
+                    pickle.dump(creds, token)
+            except Exception as e:
+                print(f"  ❌ [GDrive] Ошибка обновления токена: {e}")
+                return False
+        else:
+            print("  ❌ [GDrive] Ошибка: Токен не найден или недействителен. Сгенерируйте token.pickle локально!")
+            return False
+
+    try:
+        service = build('drive', 'v3', credentials=creds)
+
+        file_metadata = {
+            'name': filename,
+            'parents': [GOOGLE_DRIVE_FOLDER_ID]
+        }
+        media = MediaFileUpload(filepath, mimetype='text/csv')
+        file = service.files().create(
+            body=file_metadata, media_body=media, fields='id'
+        ).execute()
+        
+        print(f"  📁 Файл {filename} успешно загружен на Google Drive!")
+        return True
+
+    except Exception as e:
+        print(f"  ❌ Ошибка загрузки на Google Drive: {e}")
+        return False
+
+def save_and_upload_report(processed_data):
+    """Создает CSV локально и отправляет на Диск"""
+    if not processed_data:
+        print("\n[Отчет] Нет новых отправленных сообщений для формирования файла.")
+        return
+
+    # Генерируем имя файла с текущей датой и временем
+    now_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    filename = f"nkt_report_{now_str}.csv"
+    filepath = f"/app/data/{filename}" # Сохраняем во временный Docker Volume
+
+    try:
+        # Записываем CSV
+        with open(filepath, mode="w", encoding="utf-8-sig", newline="") as f:
+            writer = csv.writer(f, delimiter=";")
+            # Заголовки
+            writer.writerow(["ID", "Канал", "Ссылка", "Дата", "Оригинал", "Отформатировано"])
+            # Данные
+            for row in processed_data:
+                writer.writerow(row)
+        
+        print(f"\n[Отчет] Локальный файл {filename} создан. Отправка на Диск...")
+        
+        # Загружаем на Диск
+        if upload_file_to_drive(filename, filepath):
+            # Если успешно - удаляем локальный файл, чтобы не копить мусор
+            os.remove(filepath)
+            
+    except Exception as e:
+        print(f"  ❌ Ошибка создания CSV: {e}")
 
 # --- ЛОКАЛЬНЫЙ ФИЛЬТР ---
 def local_keyword_filter(text, keywords):
@@ -238,11 +331,22 @@ async def process_job(bot: Client):
         print("Нет новых сообщений для ИИ-обработки.")
         return
 
-    # Получаем db_id, raw_text, source_channel, message_id
+    # Список для сбора данных, которые ушли в канал (для выгрузки в CSV)
+    successfully_posted_data = []
+
     for db_id, raw_text, source_channel, message_id in new_messages:
         print(f"  Обработка записи БД #{db_id} из {source_channel}...")
         
-        # ИИ-фильтр получает ТОЛЬКО чистый текст!
+        # ... (код генерации ссылки остается как был) ...
+        if source_channel.startswith('@'):
+            channel_slug = source_channel[1:]
+            source_link = f"https://t.me/{channel_slug}/{message_id}"
+        elif not str(source_channel).startswith('-'):
+            source_link = f"https://t.me/{source_channel}/{message_id}"
+        else:
+            clean_chat_id = str(source_channel)[4:] if str(source_channel).startswith("-100") else str(source_channel)[1:]
+            source_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
+
         is_relevant = check_relevance(raw_text)
         if not is_relevant:
             print(f"    ❌ ИИ-фильтр: отклонено.")
@@ -250,22 +354,6 @@ async def process_job(bot: Client):
             continue
         
         print(f"    🎯 ИИ-фильтр пройден! Форматирование...")
-        
-        # --- ГЕНЕРАЦИЯ ССЫЛКИ НА ЛЕТУ ---
-        if source_channel.startswith('@'):
-            # Если канал указан как @username
-            channel_slug = source_channel[1:]
-            source_link = f"https://t.me/{channel_slug}/{message_id}"
-        elif not str(source_channel).startswith('-'):
-            # Если канал указан просто как username (без @ и без минуса)
-            source_link = f"https://t.me/{source_channel}/{message_id}"
-        else:
-            # Если это числовой ID приватного канала (начинается с -100 или -)
-            clean_chat_id = str(source_channel)[4:] if str(source_channel).startswith("-100") else str(source_channel)[1:]
-            source_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
-        # ---------------------------------
-
-        # Передаем ссылку в шаблонизатор
         formatted_messages = format_message(raw_text, source_link) 
         
         if formatted_messages:
@@ -284,7 +372,19 @@ async def process_job(bot: Client):
                     print(f"    ❌ Ошибка отправки: {send_err}")
             
             if send_success:
-                update_message_status(db_id, 'POSTED', "\n\n---\n\n".join(formatted_messages))
+                full_formatted = "\n\n---\n\n".join(formatted_messages)
+                update_message_status(db_id, 'POSTED', full_formatted)
+                
+                # ДОБАВЛЕНО: Собираем данные для CSV
+                row = [
+                    db_id, 
+                    source_channel, 
+                    source_link, 
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    (raw_text or "")[:500] + "..." if len(raw_text or "") > 500 else raw_text,
+                    (full_formatted or "")[:1000] + "..." if len(full_formatted or "") > 1000 else full_formatted
+                ]
+                successfully_posted_data.append(row)
             else:
                 update_message_status(db_id, 'SEND_ERROR')
         else:
@@ -292,6 +392,9 @@ async def process_job(bot: Client):
             update_message_status(db_id, 'FORMAT_ERROR')
 
     print(f"[{datetime.now()}] 🧠 Обработка завершена.")
+    
+    # ДОБАВЛЕНО: Вызываем сохранение и выгрузку CSV
+    save_and_upload_report(successfully_posted_data)
 
 
 async def full_agent_job(userbot: Client, bot: Client):

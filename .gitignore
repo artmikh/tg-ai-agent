@@ -1,2 +1,5 @@
 data/
 .env
+credentials.json
+get_token.py
+token.pickle
