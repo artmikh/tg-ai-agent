@@ -160,42 +160,49 @@ async def agent_job(userbot: Client, bot: Client):
         print(f"Чтение: {channel} (лимит: {limit})")
         try:
             async for message in userbot.get_chat_history(channel, limit=limit):
-                # Проверяем дату
-                if message.date.replace(tzinfo=None) < time_threshold:
-                    break
-                
                 # Берем текст или подпись к медиа
                 text = message.text or message.caption
                 if not text or is_processed(channel, message.id):
                     continue
+                
+                # СРАЗУ СОХРАНЯЕМ ID СООБЩЕНИЯ В БАЗУ!
+                save_processed(channel, message.id)
+
+                # Выводим, что сообщение вообще увидели
+                print(f"  Анализирую (ID:{message.id}): {text[:60]}...")
 
                 # ШАГ 1: Локальный фильтр
                 if not local_keyword_filter(text, KEYWORDS):
+                    print(f"    ❌ Локальный фильтр: нет ключевых слов. Пропуск.")
                     continue
+                print(f"    ✅ Локальный фильтр пройден!")
                 
                 # ШАГ 2: ИИ-фильтр
-                if check_relevance(text):
-                    print(f"Совпадение в {channel}!")
-                    
-                    # ШАГ 3: Форматирование
-                    formatted_messages = format_message(text, f"@{channel}")
-                    
-                    if formatted_messages:
-                        # ШАГ 4: Отправка каждой позиции отдельно
-                        for msg_text in formatted_messages:
-                            try:
-                                await bot.send_message(
-                                    chat_id=MY_CHANNEL_ID,
-                                    text=msg_text,
-                                    parse_mode=ParseMode.HTML
-                                )
-                                print("Успешно отправлено в канал.")
-                                await asyncio.sleep(1) # Пауза 1 сек между сообщениями
-                            except Exception as send_err:
-                                print(f"Ошибка отправки: {send_err}")
-                    
-                    # Сохраняем ID исходного сообщения, чтобы не парсить повторно
-                    save_processed(channel, message.id)
+                is_relevant = check_relevance(text)
+                if not is_relevant:
+                    print(f"    ❌ ИИ-фильтр: это не продажа или не то. Пропуск.")
+                    continue
+                
+                print(f"    🎯 ИИ-фильтр: Это продажа НКТ! Отправляем на форматирование...")
+                
+                # ШАГ 3: Форматирование
+                formatted_messages = format_message(text, f"@{channel}")
+                
+                if formatted_messages:
+                    # ШАГ 4: Отправка каждой позиции отдельно
+                    for msg_text in formatted_messages:
+                        try:
+                            await bot.send_message(
+                                chat_id=MY_CHANNEL_ID,
+                                text=msg_text,
+                                parse_mode=ParseMode.HTML
+                            )
+                            print("    🚀 Успешно отправлено в канал.")
+                            await asyncio.sleep(1) # Пауза 1 сек между сообщениями
+                        except Exception as send_err:
+                            print(f"    ❌ Ошибка отправки: {send_err}")
+                else:
+                    print("    ⚠️ ИИ не смог извлечь данные из текста.")
                     
         except Exception as e:
             print(f"Ошибка чтения {channel}: {e}")
