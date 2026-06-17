@@ -103,7 +103,8 @@ def save_new_message(channel, message_id, text, text_hash):
 def get_new_messages():
     """Берет сообщения для обработки ИИ"""
     conn = sqlite3.connect(DB_PATH)
-    cur = conn.execute('SELECT id, raw_text, source_channel, message_id FROM found_messages WHERE status = "NEW"')
+    # Добавили text_hash
+    cur = conn.execute('SELECT id, raw_text, source_channel, message_id, text_hash FROM found_messages WHERE status = "NEW"')
     rows = cur.fetchall()
     conn.close()
     return rows
@@ -117,6 +118,26 @@ def update_message_status(db_id, status, formatted_text=None):
         conn.execute('UPDATE found_messages SET status=? WHERE id=?', (status, db_id))
     conn.commit()
     conn.close()
+
+def get_duplicate_links(text_hash, current_db_id):
+    """Ищет все дубликаты сообщения в базе и возвращает список их ссылок"""
+    conn = sqlite3.connect(DB_PATH)
+    # Ищем все записи с таким же хэшем, кроме текущей
+    cur = conn.execute('SELECT source_channel, message_id FROM found_messages WHERE text_hash=? AND id != ?', (text_hash, current_db_id))
+    rows = cur.fetchall()
+    conn.close()
+    
+    links = []
+    for ch, msg_id in rows:
+        if ch.startswith('@'):
+            link = f"https://t.me/{ch[1:]}/{msg_id}"
+        elif not str(ch).startswith('-'):
+            link = f"https://t.me/{ch}/{msg_id}"
+        else:
+            clean_chat_id = str(ch)[4:] if str(ch).startswith("-100") else str(ch)[1:]
+            link = f"https://t.me/c/{clean_chat_id}/{msg_id}"
+        links.append(link)
+    return links
 
 def upload_file_to_drive(filename, filepath):
     """Загружает локальный файл на Google Drive через OAuth (от имени пользователя)"""
@@ -239,7 +260,8 @@ def check_relevance(text):
         print(f"    OpenAI Filter Error: {e}")
         return False
 
-def format_message(text, source_link):
+def format_message(text, source_links_list):
+    """Форматирует сообщение, удаляя пустые поля и отбрасывая позиции без цены"""
     prompt = config['prompts']['formatter'].format(text=text)
     try:
         resp = ai_client.chat.completions.create(
@@ -249,9 +271,6 @@ def format_message(text, source_link):
         )
         raw_text = resp.choices[0].message.content.strip()
         
-        # ВАЖНО: Выводим то, что реально ответил ИИ!
-        print(f"    [ИИ Формат] Сырой ответ: {raw_text}")
-        
         if raw_text.startswith("```json"): raw_text = raw_text[7:]
         if raw_text.startswith("```"): raw_text = raw_text[3:]
         if raw_text.endswith("```"): raw_text = raw_text[:-3]
@@ -260,30 +279,54 @@ def format_message(text, source_link):
         if isinstance(data, dict): items = [data]
         elif isinstance(data, list): items = data
         else: return []
-        
-        # Если ИИ вернул пустой список (не нашел НКТ в тексте)
-        if not items:
-            print("    [ИИ Формат] ИИ вернул пустой список. Нет позиций НКТ.")
-            return []
             
         template = config['output_template']
         results = []
+        
+        # Склеиваем все ссылки в одну строку
+        links_str = "\n".join(source_links_list) if source_links_list else ""
+        
         for item in items:
-            item["source_link"] = source_link
-            safe_item = {}
-            for key, value in item.items():
-                if isinstance(value, str):
-                    safe_item[key] = value.replace("{", "{{").replace("}", "}}")
+            # ПРОВЕРКА ЦЕНЫ: Если цены нет (null или пусто) - пропускаем позицию!
+            price_val = item.get("price")
+            if not price_val or str(price_val).strip().lower() in ["null", "none", ""]:
+                print("    ⚠️ Нет цены - пропускаем позицию.")
+                continue
+            
+            # УМНАЯ СБОРКА СТРОКИ: Проходим по каждой строке шаблона
+            lines = []
+            for line in template.split('\n'):
+                # Ищем плейсхолдеры вида {что-то}
+                matches = re.findall(r'\{([^}]+)\}', line)
+                if matches:
+                    var_name = matches[0]
+                    if var_name == "source_links":
+                        val = links_str
+                    else:
+                        val = item.get(var_name)
+
+                    # Если значение пустое (null) - не добавляем эту строку
+                    if not val or str(val).strip().lower() in ["null", "none", ""]:
+                        continue
+                    
+                    # Экранируем скобки, если они есть в самом значении
+                    safe_val = str(val).replace("{", "{{").replace("}", "}}")
+                    # Заменяем плейсхолдер на значение
+                    new_line = line.replace(f"{{{var_name}}}", safe_val)
+                    lines.append(new_line)
                 else:
-                    safe_item[key] = value
-            results.append(template.format(**safe_item))
+                    # Если в строке нет плейсхолдеров (например, пустая строка или текст)
+                    if line.strip():
+                        lines.append(line)
+            
+            formatted_text = "\n".join(lines).strip()
+            if formatted_text:
+                results.append(formatted_text)
+                
         return results
-    except json.JSONDecodeError as e:
-        print(f"    [ИИ Формат] Ошибка парсинга JSON: {e}")
-        print(f"    [ИИ Формат] Ответ был: {raw_text}")
-        return []
+        
     except Exception as e:
-        print(f"    [ИИ Формат] Общая ошибка: {e}")
+        print(f"    OpenAI Format Error: {e}")
         return []
 
 # --- АГЕНТ ---
@@ -331,21 +374,26 @@ async def process_job(bot: Client):
         print("Нет новых сообщений для ИИ-обработки.")
         return
 
-    # Список для сбора данных, которые ушли в канал (для выгрузки в CSV)
     successfully_posted_data = []
 
-    for db_id, raw_text, source_channel, message_id in new_messages:
+    # Добавили text_hash в распаковку
+    for db_id, raw_text, source_channel, message_id, text_hash in new_messages:
         print(f"  Обработка записи БД #{db_id} из {source_channel}...")
         
-        # ... (код генерации ссылки остается как был) ...
+        # Генерируем ссылку на текущее сообщение
         if source_channel.startswith('@'):
-            channel_slug = source_channel[1:]
-            source_link = f"https://t.me/{channel_slug}/{message_id}"
+            source_link = f"https://t.me/{source_channel[1:]}/{message_id}"
         elif not str(source_channel).startswith('-'):
             source_link = f"https://t.me/{source_channel}/{message_id}"
         else:
             clean_chat_id = str(source_channel)[4:] if str(source_channel).startswith("-100") else str(source_channel)[1:]
             source_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
+
+        # Ищем ссылки на дубликаты в других каналах
+        duplicate_links = get_duplicate_links(text_hash, db_id)
+        
+        # Собираем все ссылки (текущая + дубликаты)
+        all_links = [source_link] + duplicate_links
 
         is_relevant = check_relevance(raw_text)
         if not is_relevant:
@@ -354,7 +402,9 @@ async def process_job(bot: Client):
             continue
         
         print(f"    🎯 ИИ-фильтр пройден! Форматирование...")
-        formatted_messages = format_message(raw_text, source_link) 
+        
+        # Передаем список всех ссылок
+        formatted_messages = format_message(raw_text, all_links) 
         
         if formatted_messages:
             send_success = False
@@ -363,7 +413,8 @@ async def process_job(bot: Client):
                     await bot.send_message(
                         chat_id=MY_CHANNEL_ID,
                         text=msg_text,
-                        parse_mode=ParseMode.HTML
+                        parse_mode=ParseMode.HTML,
+                        disable_web_page_preview=True  # ОТКЛЮЧАЕМ ПРЕДПРОСМОТР ССЫЛОК
                     )
                     print("    🚀 Успешно отправлено в канал.")
                     send_success = True
@@ -375,11 +426,10 @@ async def process_job(bot: Client):
                 full_formatted = "\n\n---\n\n".join(formatted_messages)
                 update_message_status(db_id, 'POSTED', full_formatted)
                 
-                # ДОБАВЛЕНО: Собираем данные для CSV
                 row = [
                     db_id, 
                     source_channel, 
-                    source_link, 
+                    "\n".join(all_links), # Сохраняем все ссылки в отчет
                     datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                     (raw_text or "")[:500] + "..." if len(raw_text or "") > 500 else raw_text,
                     (full_formatted or "")[:1000] + "..." if len(full_formatted or "") > 1000 else full_formatted
@@ -388,17 +438,48 @@ async def process_job(bot: Client):
             else:
                 update_message_status(db_id, 'SEND_ERROR')
         else:
-            print("    ⚠️ ИИ не смог извлечь данные.")
+            print("    ⚠️ ИИ не смог извлечь данные (или нет цен).")
             update_message_status(db_id, 'FORMAT_ERROR')
 
     print(f"[{datetime.now()}] 🧠 Обработка завершена.")
     
-    # ДОБАВЛЕНО: Вызываем сохранение и выгрузку CSV
     save_and_upload_report(successfully_posted_data)
 
+async def cleanup_my_channel(userbot: Client):
+    """Удаляет сообщения старше X дней из канала публикации"""
+    print(f"\n[{datetime.now()}] 🧹 Очистка старых сообщений в канале...")
+    
+    num_days_ago = config['parsing']['num_days_to_delete']
+    date_to_delete = datetime.utcnow() - timedelta(days=num_days_ago)
+
+    msgs_to_delete = []
+    
+    try:
+        # Читаем последние 100 сообщений (увеличь лимит, если канал очень активный)
+        async for message in userbot.get_chat_history(MY_CHANNEL_ID, limit=150):
+            msg_date = message.date.replace(tzinfo=None)
+            
+            # Выводим отладку: видим реальную дату сообщения и порог удаления
+            print(f"    Проверка ID {message.id}: Сообщение от {msg_date} | Удаляем всё, что старше {date_to_delete}")
+            
+            # Если сообщение старше X дней, добавляем его в список на удаление
+            if msg_date < date_to_delete:
+                msgs_to_delete.append(message.id)
+                print(f"      -> ✅ Добавлено в список на удаление!")
+        
+        if msgs_to_delete:
+            # Pyrogram умеет удалять сообщения пачками (до 100 за запрос)
+            await userbot.delete_messages(chat_id=MY_CHANNEL_ID, message_ids=msgs_to_delete)
+            print(f"    🗑️ Удалено {len(msgs_to_delete)} старых сообщений.")
+        else:
+            print("    ✅ Старых сообщений нет. Канал чист.")
+            
+    except Exception as e:
+        print(f"  Ошибка при очистке канала: {e}")
 
 async def full_agent_job(userbot: Client, bot: Client):
     """Главная функция, запускаемая по расписанию"""
+    await cleanup_my_channel(userbot)
     await collect_job(userbot)
     await process_job(bot)
     schedule_mins = config['parsing']['schedule_minutes']
